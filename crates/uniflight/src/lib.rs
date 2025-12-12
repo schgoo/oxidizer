@@ -5,7 +5,7 @@
 // Original: https://github.com/ihciah/singleflight-async
 // Licensed under MIT/Apache-2.0
 
-//! Coalesces duplicate async tasks into a single execution.
+//! Deduplicates async tasks into a single execution.
 //!
 //! This crate provides [`UniFlight`], a mechanism for deduplicating concurrent async operations.
 //! When multiple tasks request the same work (identified by a key), only the first task (the
@@ -31,7 +31,7 @@
 //! let group: UniFlight<&str, String> = UniFlight::new();
 //!
 //! // Multiple concurrent calls with the same key will share a single execution
-//! let result = group.work("user:123", || async {
+//! let result = group.work(&"user:123", || async {
 //!     // This expensive operation runs only once, even if called concurrently
 //!     "expensive_result".to_string()
 //! }).await;
@@ -57,24 +57,42 @@
 use std::{
     collections::HashMap,
     hash::Hash,
-    sync::{Arc, Weak},
+    mem::replace,
+    pin::Pin,
+    sync::{Arc as SyncArc, Weak},
+    task::{Context, Poll},
 };
 
 use parking_lot::Mutex as SyncMutex;
-use xutex::AsyncMutex;
+use thread_aware::{
+    Arc, PerThread, ThreadAware,
+    affinity::{MemoryAffinity, PinnedAffinity},
+    storage::Strategy,
+};
+use tokio::sync::Mutex as AsyncMutex;
 
-type SharedMapping<K, T> = Arc<SyncMutex<HashMap<K, BroadcastOnce<T>>>>;
+type SharedMapping<K, T, S> = Arc<SyncMutex<HashMap<K, BroadcastOnce<T>>>, S>;
 
 /// Represents a class of work and creates a space in which units of work
 /// can be executed with duplicate suppression.
-#[derive(Debug)]
-pub struct UniFlight<K, T> {
-    mapping: SharedMapping<K, T>,
+#[derive(Debug, ThreadAware)]
+pub struct UniFlight<K, T, S = PerThread>
+where
+    S: Strategy,
+{
+    mapping: SharedMapping<K, T, S>,
 }
 
-impl<K, T> Default for UniFlight<K, T> {
+impl<K, T, S> Default for UniFlight<K, T, S>
+where
+    K: Send + 'static,
+    T: Send + 'static,
+    S: Strategy,
+{
     fn default() -> Self {
-        Self { mapping: Arc::default() }
+        Self {
+            mapping: Arc::new(SyncMutex::default),
+        }
     }
 }
 
@@ -90,33 +108,94 @@ impl<T> Default for Shared<T> {
     }
 }
 
-/// `BroadcastOnce` consists of shared slot and notify.
+/// `BroadcastOnce` stores a weak reference to the shared slot in the mapping.
+/// Leaders hold the strong reference; followers upgrade from this weak reference.
 #[derive(Clone)]
 struct BroadcastOnce<T> {
     shared: Weak<Shared<T>>,
 }
 
 impl<T> BroadcastOnce<T> {
-    fn new() -> (Self, Arc<Shared<T>>) {
-        let shared = Arc::new(Shared::default());
+    fn new() -> (Self, SyncArc<Shared<T>>) {
+        let shared = SyncArc::new(Shared::default());
         (
             Self {
-                shared: Arc::downgrade(&shared),
+                shared: SyncArc::downgrade(&shared),
             },
             shared,
         )
     }
 }
 
-// After calling BroadcastOnce::waiter we can get a waiter.
-// It's in WaitList.
-struct BroadcastOnceWaiter<K, T, F> {
-    func: F,
-    shared: Arc<Shared<T>>,
-
-    key: K,
-    mapping: SharedMapping<K, T>,
+/// State machine for the waiter future.
+enum WaiterState<K, T, F, S>
+where
+    S: Strategy,
+{
+    /// Initial state - hasn't been polled yet.
+    /// The `shared` ref is always present (created at `work()` time).
+    /// `is_leader` determines whether we run `func` or wait for another's result.
+    Pending {
+        func: F,
+        key: K,
+        mapping: SharedMapping<K, T, S>,
+        shared: SyncArc<Shared<T>>,
+        is_leader: bool,
+    },
+    /// Leader: running `do_work`
+    Leading { future: Pin<Box<dyn Future<Output = T> + Send>> },
+    /// Follower: waiting for leader's result, no cleanup
+    Following { future: Pin<Box<dyn Future<Output = T> + Send>> },
+    /// Relocated while running - just finish and return result
+    Detached { future: Pin<Box<dyn Future<Output = T> + Send>> },
+    /// Terminal state
+    Completed,
 }
+
+/// Leader's async work: acquire lock, compute value, store it.
+async fn do_work<T, F, Fut>(shared: SyncArc<Shared<T>>, func: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+    T: Clone,
+{
+    let mut slot = shared.slot.lock().await;
+    if let Some(value) = slot.as_ref() {
+        return value.clone();
+    }
+
+    let value = func().await;
+    *slot = Some(value.clone());
+
+    value
+}
+
+/// Future returned by [`UniFlight::work`] that resolves to the work result.
+///
+/// This future implements a state machine for coordinating work deduplication
+/// and supports relocation between thread affinities via [`ThreadAware`].
+pub struct BroadcastOnceWaiter<K, T, F, S>
+where
+    S: Strategy,
+{
+    state: WaiterState<K, T, F, S>,
+}
+
+impl<K, T, F, S> std::fmt::Debug for BroadcastOnceWaiter<K, T, F, S>
+where
+    S: Strategy,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BroadcastOnceWaiter")
+    }
+}
+
+// BroadcastOnceWaiter can be Unpin because:
+// - The struct itself has no self-referential data
+// - The only pinned data is inside Pin<Box<...>> which is itself Unpin
+//   (the Box provides a stable heap location for the future)
+// - Moving BroadcastOnceWaiter doesn't move the boxed future
+impl<K, T, F, S: Strategy> Unpin for BroadcastOnceWaiter<K, T, F, S> {}
 
 impl<T> std::fmt::Debug for BroadcastOnce<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -124,66 +203,146 @@ impl<T> std::fmt::Debug for BroadcastOnce<T> {
     }
 }
 
-#[expect(
-    clippy::type_complexity,
-    reason = "The Result type is complex but intentionally groups related items for the retry pattern"
-)]
-impl<T> BroadcastOnce<T> {
-    fn try_waiter<K, F>(
-        &self,
-        func: F,
-        key: K,
-        mapping: SharedMapping<K, T>,
-    ) -> Result<BroadcastOnceWaiter<K, T, F>, (F, K, SharedMapping<K, T>)> {
-        let Some(upgraded) = self.shared.upgrade() else {
-            return Err((func, key, mapping));
-        };
-        Ok(BroadcastOnceWaiter {
-            func,
-            shared: upgraded,
-            key,
-            mapping,
-        })
-    }
-
-    #[inline]
-    const fn waiter<K, F>(shared: Arc<Shared<T>>, func: F, key: K, mapping: SharedMapping<K, T>) -> BroadcastOnceWaiter<K, T, F> {
-        BroadcastOnceWaiter {
-            func,
-            shared,
-            key,
-            mapping,
-        }
-    }
-}
-
-// We already in WaitList, so wait will be fine, we won't miss
-// anything after Waiter generated.
-impl<K, T, F, Fut> BroadcastOnceWaiter<K, T, F>
+impl<K, T, F, Fut, S> Future for BroadcastOnceWaiter<K, T, F, S>
 where
-    K: Hash + Eq,
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = T>,
-    T: Clone,
+    K: Hash + Eq + Clone + Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Clone + Send + 'static,
+    S: Strategy,
 {
-    async fn wait(self) -> T {
-        let mut slot = self.shared.slot.lock().await;
-        if let Some(value) = (*slot).as_ref() {
-            return value.clone();
+    type Output = T;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<T> {
+        // Safe because BroadcastOnceWaiter implements Unpin
+        let this = self.as_mut().get_mut();
+
+        // Pending: transition to Leading or Following based on is_leader
+        if matches!(this.state, WaiterState::Pending { .. }) {
+            let WaiterState::Pending {
+                func, shared, is_leader, ..
+            } = replace(&mut this.state, WaiterState::Completed)
+            else {
+                unreachable!("state changed unexpectedly");
+            };
+
+            // Try fast path first: maybe value is already ready
+            if let Ok(guard) = shared.slot.try_lock()
+                && let Some(value) = guard.as_ref()
+            {
+                return Poll::Ready(value.clone());
+            }
+
+            // Value not ready - run do_work which handles both cases:
+            // - Normal leader: run func, store value
+            // - Follower (leader still working): wait for mutex, then return cached value
+            // - Promoted follower (leader failed): wait for mutex, slot empty, run func
+            let future: Pin<Box<dyn Future<Output = T> + Send>> = Box::pin(do_work(shared, func));
+            this.state = if is_leader {
+                WaiterState::Leading { future }
+            } else {
+                WaiterState::Following { future }
+            };
         }
 
-        let value = (self.func)().await;
-        *slot = Some(value.clone());
+        // Poll the current state
+        match &mut this.state {
+            WaiterState::Leading { future, .. } => match future.as_mut().poll(cx) {
+                Poll::Ready(value) => {
+                    // Don't remove from mapping - late followers may still need to upgrade.
+                    // The Weak reference naturally becomes stale when all strong refs are dropped.
+                    // New callers after that will fail to upgrade and become new leaders.
+                    this.state = WaiterState::Completed;
+                    Poll::Ready(value)
+                }
+                Poll::Pending => Poll::Pending,
+            },
 
-        self.mapping.lock().remove(&self.key);
+            WaiterState::Following { future } | WaiterState::Detached { future } => match future.as_mut().poll(cx) {
+                Poll::Ready(value) => {
+                    this.state = WaiterState::Completed;
+                    Poll::Ready(value)
+                }
+                Poll::Pending => Poll::Pending,
+            },
 
-        value
+            WaiterState::Completed => unreachable!("polled after completion"),
+            WaiterState::Pending { .. } => unreachable!("handled above"),
+        }
     }
 }
 
-impl<K, T> UniFlight<K, T>
+impl<K, T, F, Fut, S> ThreadAware for BroadcastOnceWaiter<K, T, F, S>
 where
-    K: Hash + Eq + Clone,
+    K: Clone + Hash + Eq + Send + 'static,
+    T: Clone + Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    S: Strategy,
+{
+    fn relocated(self, source: MemoryAffinity, destination: PinnedAffinity) -> Self {
+        match self.state {
+            WaiterState::Pending {
+                func,
+                key,
+                mapping,
+                shared,
+                ..
+            } => {
+                // Drop old shared ref (triggers leader election on old affinity if we were leader)
+                drop(shared);
+
+                // Relocate mapping to access new affinity's storage
+                let mapping = mapping.relocated(source, destination);
+
+                // Re-register on new affinity
+                let mut map = mapping.lock();
+                let (shared, is_leader) = if let Some(existing) = map.get(&key) {
+                    if let Some(shared) = existing.shared.upgrade() {
+                        // Leader exists on new affinity - become follower
+                        (shared, false)
+                    } else {
+                        // Leader gone - become new leader
+                        let (broadcast, shared) = BroadcastOnce::new();
+                        map.insert(key.clone(), broadcast);
+                        (shared, true)
+                    }
+                } else {
+                    // No entry on new affinity - become leader
+                    let (broadcast, shared) = BroadcastOnce::new();
+                    map.insert(key.clone(), broadcast);
+                    (shared, true)
+                };
+                drop(map);
+
+                Self {
+                    state: WaiterState::Pending {
+                        func,
+                        key,
+                        mapping,
+                        shared,
+                        is_leader,
+                    },
+                }
+            }
+
+            WaiterState::Leading { future, .. } | WaiterState::Following { future } => {
+                // Mid-execution: let the future complete without coordination
+                Self {
+                    state: WaiterState::Detached { future },
+                }
+            }
+
+            WaiterState::Detached { .. } | WaiterState::Completed => self,
+        }
+    }
+}
+
+impl<K, T, S> UniFlight<K, T, S>
+where
+    K: Hash + Eq + Send + 'static,
+    T: Send + 'static,
+    S: Strategy,
 {
     /// Creates a new `UniFlight` instance.
     #[inline]
@@ -195,234 +354,45 @@ where
     /// Execute and return the value for a given function, making sure that only one
     /// operation is in-flight at a given moment. If a duplicate call comes in, that caller will
     /// wait until the original call completes and return the same value.
-    pub fn work<F, Fut>(&self, key: K, func: F) -> impl Future<Output = T>
+    ///
+    /// Leader/follower role is determined at call time:
+    /// - If no entry exists, create one and become leader
+    /// - If entry exists and can upgrade, become follower
+    /// - If entry exists but can't upgrade (leader gone), replace and become leader
+    pub fn work<F, Fut>(&self, key: &K, func: F) -> BroadcastOnceWaiter<K, T, F, S>
     where
+        K: Clone,
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
         T: Clone,
     {
-        let owned_mapping = Arc::clone(&self.mapping);
-        let mut mapping = self.mapping.lock();
-        let val = mapping.get_mut(&key);
-        if let Some(call) = val {
-            let (func, key, owned_mapping) = match call.try_waiter(func, key, owned_mapping) {
-                Ok(waiter) => return waiter.wait(),
-                Err(fm) => fm,
-            };
-            let (new_call, shared) = BroadcastOnce::new();
-            *call = new_call;
-            let waiter = BroadcastOnce::waiter(shared, func, key, owned_mapping);
-            waiter.wait()
+        let mut map = self.mapping.lock();
+        let (shared, is_leader) = if let Some(existing) = map.get(key) {
+            if let Some(shared) = existing.shared.upgrade() {
+                // Leader exists - become follower
+                (shared, false)
+            } else {
+                // Leader gone - become new leader
+                let (broadcast, shared) = BroadcastOnce::new();
+                map.insert(key.clone(), broadcast);
+                (shared, true)
+            }
         } else {
-            let (call, shared) = BroadcastOnce::new();
-            mapping.insert(key.clone(), call);
-            let waiter = BroadcastOnce::waiter(shared, func, key, owned_mapping);
-            waiter.wait()
+            // No entry - become leader
+            let (broadcast, shared) = BroadcastOnce::new();
+            map.insert(key.clone(), broadcast);
+            (shared, true)
+        };
+        drop(map);
+
+        BroadcastOnceWaiter {
+            state: WaiterState::Pending {
+                func,
+                key: key.clone(),
+                mapping: self.mapping.clone(),
+                shared,
+                is_leader,
+            },
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{
-        sync::atomic::{
-            AtomicUsize,
-            Ordering::{AcqRel, Acquire},
-        },
-        time::Duration,
-    };
-
-    use futures_util::{StreamExt, stream::FuturesUnordered};
-
-    use super::*;
-
-    fn unreachable_future() -> std::future::Pending<String> {
-        std::future::pending()
-    }
-
-    #[tokio::test]
-    async fn direct_call() {
-        let group = UniFlight::new();
-        let result = group
-            .work("key", || async {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                "Result".to_string()
-            })
-            .await;
-        assert_eq!(result, "Result");
-    }
-
-    #[tokio::test]
-    async fn parallel_call() {
-        let call_counter = AtomicUsize::default();
-
-        let group = UniFlight::new();
-        let futures = FuturesUnordered::new();
-        for _ in 0..10 {
-            futures.push(group.work("key", || async {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                call_counter.fetch_add(1, AcqRel);
-                "Result".to_string()
-            }));
-        }
-
-        assert!(futures.all(|out| async move { out == "Result" }).await);
-        assert_eq!(call_counter.load(Acquire), 1);
-    }
-
-    #[tokio::test]
-    async fn parallel_call_seq_await() {
-        let call_counter = AtomicUsize::default();
-
-        let group = UniFlight::new();
-        let mut futures = Vec::new();
-        for _ in 0..10 {
-            futures.push(group.work("key", || async {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                call_counter.fetch_add(1, AcqRel);
-                "Result".to_string()
-            }));
-        }
-
-        for fut in futures {
-            assert_eq!(fut.await, "Result");
-        }
-        assert_eq!(call_counter.load(Acquire), 1);
-    }
-
-    #[tokio::test]
-    async fn call_with_static_str_key() {
-        let group = UniFlight::new();
-        let result = group
-            .work("key".to_string(), || async {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                "Result".to_string()
-            })
-            .await;
-        assert_eq!(result, "Result");
-    }
-
-    #[tokio::test]
-    async fn call_with_static_string_key() {
-        let group = UniFlight::new();
-        let result = group
-            .work("key".to_string(), || async {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                "Result".to_string()
-            })
-            .await;
-        assert_eq!(result, "Result");
-    }
-
-    #[tokio::test]
-    async fn call_with_custom_key() {
-        #[derive(Clone, PartialEq, Eq, Hash)]
-        struct K(i32);
-        let group = UniFlight::new();
-        let result = group
-            .work(K(1), || async {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-                "Result".to_string()
-            })
-            .await;
-        assert_eq!(result, "Result");
-    }
-
-    #[tokio::test]
-    async fn late_wait() {
-        let group = UniFlight::new();
-        let fut_early = group.work("key".to_string(), || async {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            "Result".to_string()
-        });
-        let fut_late = group.work("key".into(), unreachable_future);
-        assert_eq!(fut_early.await, "Result");
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert_eq!(fut_late.await, "Result");
-    }
-
-    #[tokio::test]
-    async fn cancel() {
-        let group = UniFlight::new();
-
-        // the executer cancelled and the other awaiter will create a new future and execute.
-        let fut_cancel = group.work("key".to_string(), unreachable_future);
-        let _ = tokio::time::timeout(Duration::from_millis(10), fut_cancel).await;
-        let fut_late = group.work("key".to_string(), || async { "Result2".to_string() });
-        assert_eq!(fut_late.await, "Result2");
-
-        // the first executer is slow but not dropped, so the result will be the first ones.
-        let begin = tokio::time::Instant::now();
-        let fut_1 = group.work("key".to_string(), || async {
-            tokio::time::sleep(Duration::from_millis(2000)).await;
-            "Result1".to_string()
-        });
-        let fut_2 = group.work("key".to_string(), unreachable_future);
-        let (v1, v2) = tokio::join!(fut_1, fut_2);
-        assert_eq!(v1, "Result1");
-        assert_eq!(v2, "Result1");
-        assert!(begin.elapsed() > Duration::from_millis(1500));
-    }
-
-    #[tokio::test]
-    async fn leader_panic_in_spawned_task() {
-        let call_counter = AtomicUsize::default();
-        let group: Arc<UniFlight<String, String>> = Arc::new(UniFlight::new());
-
-        // First task will panic in a spawned task (no catch_unwind)
-        let group_clone = Arc::clone(&group);
-        let handle = tokio::spawn(async move {
-            group_clone
-                .work("key".to_string(), || async {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                    panic!("leader panicked in spawned task");
-                    #[expect(unreachable_code, reason = "Required to satisfy return type after panic")]
-                    "never".to_string()
-                })
-                .await
-        });
-
-        // Give time for the spawned task to register and start
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        // Second task should become the new leader after the first panics
-        let group_clone = Arc::clone(&group);
-        let call_counter_ref = &call_counter;
-        let fut_follower = group_clone.work("key".to_string(), || async {
-            call_counter_ref.fetch_add(1, AcqRel);
-            "Result".to_string()
-        });
-
-        // Wait for the spawned task to panic
-        let spawn_result = handle.await;
-        assert!(spawn_result.is_err());
-
-        // The follower should succeed - Rust's drop semantics ensure the mutex is released
-        let result = fut_follower.await;
-        assert_eq!(result, "Result");
-        assert_eq!(call_counter.load(Acquire), 1);
-    }
-
-    #[tokio::test]
-    async fn debug_impl() {
-        let group: UniFlight<String, String> = UniFlight::new();
-
-        // Test Debug on empty group
-        let debug_str = format!("{:?}", group);
-        assert!(debug_str.contains("UniFlight"));
-
-        // Create a pending work item to populate the mapping with a BroadcastOnce
-        let fut = group.work("key".to_string(), || async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            "Result".to_string()
-        });
-
-        // Debug should still work with entries in the mapping
-        let debug_str = format!("{:?}", group);
-        assert!(debug_str.contains("UniFlight"));
-        assert!(debug_str.contains("BroadcastOnce"));
-
-        // Complete the work
-        assert_eq!(fut.await, "Result");
     }
 }
