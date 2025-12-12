@@ -15,15 +15,19 @@ use std::{
     time::Duration,
 };
 
+use thread_aware::PerThread;
 use uniflight::UniFlight;
 
 #[tokio::main]
 async fn main() {
     // Create a shared UniFlight instance for cache operations
-    let cache_group = Arc::new(UniFlight::<String, String>::new());
+    let cache_group: Arc<UniFlight<String, String, PerThread>> = Arc::new(UniFlight::new());
 
     // Track how many times the work closure actually executes
     let execution_count = Arc::new(AtomicUsize::new(0));
+
+    // The key to use for deduplication
+    let cache_key = Arc::new("user:123".to_string());
 
     println!("Starting 5 concurrent requests for user:123...\n");
 
@@ -32,11 +36,12 @@ async fn main() {
     for i in 1..=5 {
         let group = Arc::clone(&cache_group);
         let counter = Arc::clone(&execution_count);
+        let key = Arc::clone(&cache_key);
         let handle = tokio::spawn(async move {
             let start = tokio::time::Instant::now();
 
             let result = group
-                .work("user:123".to_string(), || async {
+                .work(&*key, move || async move {
                     let count = counter.fetch_add(1, Ordering::SeqCst) + 1;
                     println!("  [Request {i}] I'm the leader! Fetching from database... (execution #{count})");
 
