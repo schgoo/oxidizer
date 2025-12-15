@@ -190,11 +190,6 @@ where
     }
 }
 
-// BroadcastOnceWaiter can be Unpin because:
-// - The struct itself has no self-referential data
-// - The only pinned data is inside Pin<Box<...>> which is itself Unpin
-//   (the Box provides a stable heap location for the future)
-// - Moving BroadcastOnceWaiter doesn't move the boxed future
 impl<K, T, F, S: Strategy> Unpin for BroadcastOnceWaiter<K, T, F, S> {}
 
 impl<T> std::fmt::Debug for BroadcastOnce<T> {
